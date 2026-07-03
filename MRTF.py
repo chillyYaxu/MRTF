@@ -15,7 +15,6 @@ from scipy.spatial.distance import cdist
 
 
 
-
 class proposed:
     def __init__(self, F_t1, C_t1, C_t2, RM_win_size=20, scale_factor=16, similar_win_size=20, similar_num=20):
         self.F_t1 = F_t1.astype(np.float32)
@@ -505,41 +504,15 @@ class proposed:
         
         return coeffs_fused, r
 
-    def regression_model_fitting_combined_v2(self, band_idx, scales=[1, 2, 4], 
-                                       non_linear_ratio=0.3, sigma=0.12,
-                                       min_val=None, max_val=None):
+    def regression_model_fitting_linear(self, band_idx, scales=[1, 2, 4], 
+                                        sigma=0.12,
+                                        min_val=None, max_val=None):
         """
-        组合回归：多尺度线性(Huber) + 多尺度非线性回归（局部加权多项式）
+        多尺度线性Huber回归
         
         核心思想：
         1. 多尺度线性Huber回归：捕捉全局线性趋势，对异常值鲁棒
-        2. 多尺度非线性回归：使用局部加权二次多项式，捕捉非线性细节
-        3. 自适应融合：根据纹理复杂度动态调整两者权重
-        4. 严格的范围限制：确保预测值在有效范围内
-        
-        Parameters:
-        -----------
-        band_idx : int
-            波段索引
-        scales : list
-            多尺度回归的尺度因子列表
-        non_linear_ratio : float
-            非线性部分的基础权重 (0-1)
-        sigma : float
-            局部回归的带宽参数
-        min_val : float or None
-            数据最小值，如果为None则自动从数据中检测
-        max_val : float or None
-            数据最大值，如果为None则自动从数据中检测
-        
-        Returns:
-        --------
-        coeffs_fused : array (h, w, 2)
-            拟合系数 [intercept, slope]
-        r : array (h, w)
-            残差
-        combined_pred : array (h, w)
-            组合预测值（已限制范围）
+        2. 多尺度自适应融合：根据纹理复杂度动态调整尺度权重
         """
         
         C_t1_band = self.C_t1[:, :, band_idx]
@@ -568,15 +541,14 @@ class proposed:
         sigma_adaptive = sigma * data_range if data_range > 1e-8 else sigma
         
         print(f"\n{'='*60}")
-        print(f"Combined Regression for Band {band_idx}")
+        print(f"Multi-Scale Huber Regression for Band {band_idx}")
         print(f"{'='*60}")
         print(f"  Input range: [{min_val:.4f}, {max_val:.4f}]")
         print(f"  Data range: {data_range:.4f}")
         print(f"  Normalized range: [-1.0, 1.0]")
-        print(f"  Multi-Scale Scales: {scales}")
-        print(f"  Non-linear ratio: {non_linear_ratio}")
+        print(f"  Scales: {scales}")
         
-        # ============ 1. 局部纹理复杂度（仅用于adaptive_weight） ============
+        # ============ 1. 局部纹理复杂度（用于多尺度权重） ============
         gy, gx = np.gradient(C_t1_norm)
         gradient_mag = np.sqrt(gx**2 + gy**2)
         local_texture = uniform_filter(gradient_mag, size=5, mode='reflect')
@@ -584,163 +556,27 @@ class proposed:
         t_max = np.percentile(local_texture, 95)
         texture_norm = np.clip(local_texture / max(t_max, 1e-6), 0, 1)
         
-        # 自适应融合权重
-        adaptive_weight = non_linear_ratio * (0.5 + 0.5 * texture_norm)
-        
         print(f"  Texture range: [{np.min(texture_norm):.3f}, {np.max(texture_norm):.3f}]")
-        print(f"  Weight range: [{np.min(adaptive_weight):.3f}, {np.max(adaptive_weight):.3f}]")
         
-        # ============ 预计算多尺度图像 ============
+        # ============ 2. 预计算多尺度图像 ============
         scaled_images = {}
         for scale in scales:
             if scale > 1:
                 h_scale, w_scale = h // scale, w // scale
                 C_t1_scale = resize(C_t1_norm, (h_scale, w_scale), order=1, preserve_range=True)
                 C_t2_scale = resize(C_t2_norm, (h_scale, w_scale), order=1, preserve_range=True)
-                scaled_images[scale] = (C_t1_scale, C_t2_scale, h_scale, w_scale)
+                texture_scale = resize(texture_norm, (h_scale, w_scale), order=1, preserve_range=True)
+                scaled_images[scale] = (C_t1_scale, C_t2_scale, texture_scale, h_scale, w_scale)
             else:
-                scaled_images[scale] = (C_t1_norm, C_t2_norm, h, w)
-        
-        # ============ 2. 多尺度非线性回归（局部加权二次多项式） ============
-        print("\n  [Part A] Computing Multi-Scale Nonlinear Regression (Local Quadratic)...")
-        
-        @jit(nopython=True, parallel=True)
-        def fast_quadratic_loop(C_t1_scale, C_t2_scale, h_scale, w_scale,
-                            scale_win, pad_size, global_t2_mean, bandwidth):
-            """
-            局部加权二次多项式回归
-            f(x) = a + b*x + c*x^2
-            使用三线性核权重
-            """
-            pred = np.zeros((h_scale, w_scale), dtype=np.float32)
-            win_area = scale_win * scale_win
-            
-            for i in prange(h_scale):
-                x_win = np.zeros(win_area, dtype=np.float32)
-                y_win = np.zeros(win_area, dtype=np.float32)
-                
-                for j in range(w_scale):
-                    n_valid = 0
-                    for ii in range(scale_win):
-                        row = i + ii
-                        for jj in range(scale_win):
-                            col = j + jj
-                            x_val = C_t1_scale[row, col]
-                            y_val = C_t2_scale[row, col]
-                            
-                            if not np.isnan(x_val) and not np.isnan(y_val):
-                                x_win[n_valid] = x_val
-                                y_win[n_valid] = y_val
-                                n_valid += 1
-                    
-                    center_x = C_t1_scale[i + pad_size, j + pad_size]
-                    
-                    if n_valid >= 6:  # 二次多项式需要至少6个点
-                        # 构建加权最小二乘
-                        # 设计矩阵: [1, x, x^2]
-                        X = np.zeros((n_valid, 3), dtype=np.float32)
-                        W = np.zeros((n_valid, n_valid), dtype=np.float32)
-                        y = y_win[:n_valid]
-                        
-                        # 计算三线性核权重
-                        x_range = np.max(x_win[:n_valid]) - np.min(x_win[:n_valid])
-                        h = max(bandwidth, x_range * 0.1)  # 自适应带宽
-                        
-                        for k in range(n_valid):
-                            xk = x_win[k]
-                            X[k, 0] = 1.0
-                            X[k, 1] = xk
-                            X[k, 2] = xk * xk
-                            
-                            # 三线性核权重
-                            dist = abs(xk - center_x)
-                            if dist <= h:
-                                weight = (1.0 - (dist / h)) ** 3
-                            else:
-                                weight = 1e-6
-                            W[k, k] = weight
-                        
-                        # 求解加权最小二乘 (X^T W X) beta = X^T W y
-                        XtW = np.dot(X.T, W)
-                        XtWX = np.dot(XtW, X)
-                        XtWy = np.dot(XtW, y)
-                        
-                        # 添加小的正则化项
-                        for k in range(3):
-                            XtWX[k, k] += 1e-6
-                        
-                        try:
-                            coeffs = np.linalg.solve(XtWX, XtWy)
-                            # 预测: a + b*x + c*x^2
-                            pred_val = coeffs[0] + coeffs[1] * center_x + coeffs[2] * center_x * center_x
-                        except:
-                            # 失败时使用局部均值
-                            pred_val = np.mean(y)
-                    elif n_valid >= 3:
-                        # 点数不足，使用线性拟合
-                        xv = x_win[:n_valid]
-                        yv = y_win[:n_valid]
-                        x_mean = np.mean(xv)
-                        y_mean = np.mean(yv)
-                        numerator = np.sum((xv - x_mean) * (yv - y_mean))
-                        denominator = np.sum((xv - x_mean)**2)
-                        
-                        if abs(denominator) > 1e-8:
-                            slope = numerator / denominator
-                            intercept = y_mean - slope * x_mean
-                            pred_val = intercept + slope * center_x
-                        else:
-                            pred_val = y_mean
-                    else:
-                        pred_val = global_t2_mean if n_valid == 0 else np.mean(y_win[:n_valid])
-                    
-                    # 严格限制在 [-1, 1] 范围内
-                    pred[i, j] = max(-1.0, min(1.0, pred_val))
-            
-            return pred
-        
-        # 计算各尺度非线性预测
-        nonlinear_preds_list = []
-        
-        for scale in scales:
-            C_t1_scale, C_t2_scale, h_scale, w_scale = scaled_images[scale]
-            
-            scale_win = max(win_size // scale, 5)
-            pad_size = scale_win // 2
-            
-            C_t1_pad_scale = np.pad(C_t1_scale, pad_size, mode='reflect')
-            C_t2_pad_scale = np.pad(C_t2_scale, pad_size, mode='reflect')
-            
-            mask_scale = ~np.isnan(C_t2_scale)
-            global_t2_mean_scale = np.mean(C_t2_scale[mask_scale]) if mask_scale.any() else 0.0
-            
-            # 自适应带宽
-            bandwidth_scale = sigma_adaptive * np.sqrt(scale)
-            
-            scale_pred = fast_quadratic_loop(
-                C_t1_pad_scale, C_t2_pad_scale, h_scale, w_scale,
-                scale_win, pad_size, global_t2_mean_scale, bandwidth_scale
-            )
-            
-            if scale > 1:
-                pred_up = resize(scale_pred, (h, w), order=1, preserve_range=True)
-                nonlinear_preds_list.append(pred_up)
-            else:
-                nonlinear_preds_list.append(scale_pred)
-        
-        # 多尺度非线性融合：简单平均
-        nonlinear_fused_norm = np.mean(nonlinear_preds_list, axis=0)
-        nonlinear_fused_norm = np.clip(nonlinear_fused_norm, -1.0, 1.0)
+                scaled_images[scale] = (C_t1_norm, C_t2_norm, texture_norm, h, w)
         
         # ============ 3. 多尺度线性Huber回归 ============
-        print("\n  [Part B] Computing Multi-Scale Linear Regression (Huber)...")
-        
-        linear_preds_list = []
+        print("\n  Computing Multi-Scale Linear Regression (Huber)...")
         
         @jit(nopython=True, parallel=True)
         def fast_linear_huber_loop(C_t1_scale, C_t2_scale, h_scale, w_scale,
-                                scale_win, pad_size, global_t2_mean, delta):
-            """多尺度线性Huber回归循环，带范围限制"""
+                                    scale_win, pad_size, global_t2_mean, delta):
+            """多尺度线性Huber回归"""
             scale_pred = np.zeros((h_scale, w_scale), dtype=np.float32)
             win_area = scale_win * scale_win
             
@@ -749,6 +585,7 @@ class proposed:
                 y_win = np.zeros(win_area, dtype=np.float32)
                 
                 for j in range(w_scale):
+                    # 收集窗口内的有效像素
                     n_valid = 0
                     for ii in range(scale_win):
                         row = i + ii
@@ -790,7 +627,7 @@ class proposed:
                             slope = 0.0
                             intercept = y_mean
                         
-                        # Huber加权优化
+                        # Huber加权优化（迭代一次）
                         w_sum = 0.0
                         wx_sum = 0.0
                         wy_sum = 0.0
@@ -823,14 +660,15 @@ class proposed:
                     else:
                         pred_val = global_t2_mean
                     
-                    # 严格限制在 [-1, 1] 范围内
                     scale_pred[i, j] = max(-1.0, min(1.0, pred_val))
             
             return scale_pred
         
         # 计算各尺度线性预测
+        linear_preds_list = []
+        
         for scale in scales:
-            C_t1_scale, C_t2_scale, h_scale, w_scale = scaled_images[scale]
+            C_t1_scale, C_t2_scale, texture_scale, h_scale, w_scale = scaled_images[scale]
             
             scale_win = max(win_size // scale, 5)
             pad_size = scale_win // 2
@@ -841,8 +679,9 @@ class proposed:
             mask_scale = ~np.isnan(C_t2_scale)
             global_t2_mean_scale = np.mean(C_t2_scale[mask_scale]) if mask_scale.any() else 0.0
             
-            delta = 0.1  # 归一化空间的10%
+            delta = 0.1  # Huber阈值
             
+            print(f"    Processing scale {scale}...")
             scale_pred = fast_linear_huber_loop(
                 C_t1_pad_scale, C_t2_pad_scale, h_scale, w_scale,
                 scale_win, pad_size, global_t2_mean_scale, delta
@@ -854,49 +693,74 @@ class proposed:
             else:
                 linear_preds_list.append(scale_pred)
         
-        # 多尺度线性融合：简单平均
-        linear_fused_norm = np.mean(linear_preds_list, axis=0)
+        # ============ 4. 多尺度融合 ============
+        print("\n  Fusing multi-scale predictions...")
+        
+        n_scales = len(scales)
+        if n_scales == 1:
+            linear_fused_norm = linear_preds_list[0]
+        elif n_scales == 2:
+            # 小尺度权重 = 纹理强度，大尺度权重 = 1-纹理强度
+            weights = [texture_norm, 1.0 - texture_norm]
+            linear_fused_norm = weights[0] * linear_preds_list[0] + weights[1] * linear_preds_list[1]
+        elif n_scales == 3:
+            # 三尺度融合：小尺度捕捉细节（纹理区域权重高）
+            #           中尺度过渡
+            #           大尺度捕捉结构（平滑区域权重高）
+            w_small = texture_norm
+            w_medium = 1.0 - 2.0 * np.abs(texture_norm - 0.5)
+            w_medium = np.maximum(w_medium, 0.0)
+            w_large = 1.0 - texture_norm
+            total_w = w_small + w_medium + w_large + 1e-8
+            linear_fused_norm = (w_small * linear_preds_list[0] + 
+                                w_medium * linear_preds_list[1] + 
+                                w_large * linear_preds_list[2]) / total_w
+        else:
+            # 通用多尺度融合
+            weights = []
+            for s in range(n_scales):
+                if s == 0:  # 最小尺度
+                    w = texture_norm
+                elif s == n_scales - 1:  # 最大尺度
+                    w = 1.0 - texture_norm
+                else:  # 中间尺度
+                    center = s / (n_scales - 1)
+                    w = 1.0 - 2.0 * np.abs(texture_norm - center)
+                    w = np.maximum(w, 0.0)
+                weights.append(w)
+            
+            total_w = sum(weights) + 1e-8
+            linear_fused_norm = sum(w * p for w, p in zip(weights, linear_preds_list)) / total_w
+        
         linear_fused_norm = np.clip(linear_fused_norm, -1.0, 1.0)
         
-        # ============ 4. 自适应融合 ============
-        print("\n  [Part C] Adaptive Fusion...")
-        
-        combined_pred_norm = (1 - adaptive_weight) * linear_fused_norm + adaptive_weight * nonlinear_fused_norm
-        combined_pred_norm = np.clip(combined_pred_norm, -1.0, 1.0)
-        
-        # ============ 5. 反归一化回原始范围 ============
+        # ============ 5. 反归一化 ============
         if data_range > 1e-8:
-            combined_pred = (combined_pred_norm + 1.0) / 2.0 * data_range + min_val
-            linear_fused = (linear_fused_norm + 1.0) / 2.0 * data_range + min_val
-            nonlinear_fused = (nonlinear_fused_norm + 1.0) / 2.0 * data_range + min_val
+            combined_pred = (linear_fused_norm + 1.0) / 2.0 * data_range + min_val
         else:
-            combined_pred = combined_pred_norm
-            linear_fused = linear_fused_norm
-            nonlinear_fused = nonlinear_fused_norm
+            combined_pred = linear_fused_norm
         
-        # 再次限制到原始范围
         combined_pred = np.clip(combined_pred, min_val, max_val)
         
-        # 输出统计信息
-        linear_mse = np.mean((C_t2_band - linear_fused)**2)
-        nonlinear_mse = np.mean((C_t2_band - nonlinear_fused)**2)
-        combined_mse = np.mean((C_t2_band - combined_pred)**2)
+        # 输出性能统计
+        mse = np.mean((C_t2_band - combined_pred)**2)
+        mae = np.mean(np.abs(C_t2_band - combined_pred))
         
-        print(f"\n  Performance Comparison:")
-        print(f"    Linear MSE: {linear_mse:.6f}")
-        print(f"    Nonlinear MSE: {nonlinear_mse:.6f}")
-        print(f"    Combined MSE: {combined_mse:.6f}")
-        print(f"    Improvement: {(linear_mse - combined_mse) / linear_mse * 100:.2f}%")
+        print(f"\n  Performance:")
+        print(f"    MSE: {mse:.6f}")
+        print(f"    MAE: {mae:.6f}")
         
         # ============ 6. 反推线性系数 ============
+        print("  Computing final coefficients...")
         coeffs_fused = np.zeros((h, w, 2), dtype=np.float32)
+        half_win = win_size // 2
         
         for i in range(h):
+            i_min = max(0, i - half_win)
+            i_max = min(h, i + half_win + 1)
             for j in range(w):
-                i_min = max(0, i - win_size//2)
-                i_max = min(h, i + win_size//2 + 1)
-                j_min = max(0, j - win_size//2)
-                j_max = min(w, j + win_size//2 + 1)
+                j_min = max(0, j - half_win)
+                j_max = min(w, j + half_win + 1)
                 
                 x_local = C_t1_band[i_min:i_max, j_min:j_max].flatten()
                 y_local = combined_pred[i_min:i_max, j_min:j_max].flatten()
@@ -919,18 +783,8 @@ class proposed:
                         slope = 0.0
                         intercept = y_mean
                     
-                    # 约束系数
                     slope = np.clip(slope, -2.0, 2.0)
                     intercept = np.clip(intercept, min_val, max_val)
-                    
-                    # 检查端点约束
-                    pred_at_min = intercept + slope * min_val
-                    pred_at_max = intercept + slope * max_val
-                    
-                    if pred_at_min < min_val:
-                        slope = (min_val - intercept) / (min_val + 1e-8)
-                    if pred_at_max > max_val:
-                        slope = (max_val - intercept) / (max_val + 1e-8)
                     
                     coeffs_fused[i, j] = [intercept, slope]
                 else:
@@ -1148,88 +1002,157 @@ class proposed:
         
         print(f"  Finished processing")
         return SF_pred
+    
 
     def residual_compensation_up(self, F_t2_SF_pred, residuals, 
-                                            F_t1_similar_indices, 
-                                            F_t1_similar_weights, band_idx):
+                                                  F_t1_similar_indices, 
+                                                  F_t1_similar_weights, band_idx):
         """
-        简化的引导滤波差异图残差补偿
+        残差补偿（半向量化优化版本）
         """        
         
         h, w = residuals.shape
         win_size = self.similar_win_size
         pad_size = win_size // 2
         
-        # ============ 步骤1: 计算初始差异图 ============
+        # ============ 步骤1: 计算差异图 ============
         C_Upscale = resize(self.C_t1[:,:,band_idx], (h, w), order=3, preserve_range=True)
         F_t1_band = self.F_t1[:, :, band_idx]     
-        diff_map = np.abs(C_Upscale-F_t1_band)
+        diff_map = np.abs(C_Upscale - F_t1_band)
         rmse = np.sqrt(np.mean(diff_map ** 2))
-        dif_map_lr = diff_map*rmse
+        dif_map_lr = diff_map * rmse
         
-        # ============ 步骤2: 引导滤波优化 ============
+        # ============ 步骤2: 引导滤波优化差异图 ============
         def simple_guided(I, p, r=1, eps=0.01):
-            """简化的引导滤波"""
             window = 2 * r + 1
-            N = uniform_filter(np.ones_like(I), window, mode='reflect')
-            
-            mean_I = uniform_filter(I, window, mode='reflect') / N
-            mean_p = uniform_filter(p, window, mode='reflect') / N
-            mean_Ip = uniform_filter(I * p, window, mode='reflect') / N
-            mean_II = uniform_filter(I * I, window, mode='reflect') / N
+            mean_I = uniform_filter(I, window, mode='reflect')
+            mean_p = uniform_filter(p, window, mode='reflect')
+            mean_Ip = uniform_filter(I * p, window, mode='reflect')
+            mean_II = uniform_filter(I * I, window, mode='reflect')
             
             a = (mean_Ip - mean_I * mean_p) / (mean_II - mean_I * mean_I + eps)
             b = mean_p - a * mean_I
             
-            mean_a = uniform_filter(a, window, mode='reflect') / N
-            mean_b = uniform_filter(b, window, mode='reflect') / N
+            mean_a = uniform_filter(a, window, mode='reflect')
+            mean_b = uniform_filter(b, window, mode='reflect')
             
             return mean_a * I + mean_b
-    
         
-        # 对差异图应用引导滤波
         dif_map_lr_refined = simple_guided(F_t1_band, dif_map_lr, r=1, eps=0.01)
         
-        # ============ 步骤4: 填充和补偿 ============
+        # ============ 步骤3: 填充和准备数据 ============
+        F_t1_pad = np.pad(F_t1_band, pad_size, mode='reflect')
         residuals_pad = np.pad(residuals, pad_size, mode='reflect')
         dif_pad = np.pad(dif_map_lr_refined, pad_size, mode='reflect')
         
-        Fit_FC_pred = F_t2_SF_pred.copy()
-        pred_residuals = np.zeros_like(residuals)
+        # 使用列表推导和numba加速（如果可用）
+        try:
+            from numba import jit
+            USE_NUMBA = True
+        except ImportError:
+            USE_NUMBA = False
         
-        for i in range(h):
-            for j in range(w):
-                r_window = residuals_pad[i:i+win_size, j:j+win_size].ravel()
-                d_window = dif_pad[i:i+win_size, j:j+win_size].ravel()
+        if USE_NUMBA:
+            @jit(nopython=True)
+            def compute_compensation_numba(F_t1_pad, residuals_pad, dif_pad, 
+                                        similar_indices, similar_weights, 
+                                        h, w, win_size, pad_size):
+                pred_residuals = np.zeros((h, w))
+                Fit_FC_pred = np.zeros((h, w))
                 
-                idx = F_t1_similar_indices[i, j]
-                wgt = F_t1_similar_weights[i, j]
-                
-                valid = wgt > 0
-                if not np.any(valid):
-                    continue
-                
-                idx_valid = idx[valid]
-                wgt_valid = wgt[valid]
-                
-                valid_idx = idx_valid < len(r_window)
-                if not np.any(valid_idx):
-                    continue
-                
-                idx_final = idx_valid[valid_idx]
-                wgt_final = wgt_valid[valid_idx]
-                r_vals = r_window[idx_final]
-                d_vals = d_window[idx_final]
-                
-                # 使用优化后的差异图计算权重
-                d_weights = d_vals / (np.max(d_vals) + 1e-8)
-                combined_weights = wgt_final * d_weights  
-                residual = np.sum(r_vals * combined_weights)
-                
-                pred_residuals[i, j] = residual
-                Fit_FC_pred[i, j] += residual
-    
+                for i in range(h):
+                    for j in range(w):
+                        # 获取局部窗口
+                        r_window = residuals_pad[i:i+win_size, j:j+win_size]
+                        f_window = F_t1_pad[i:i+win_size, j:j+win_size]
+                        d_window = dif_pad[i:i+win_size, j:j+win_size]
+                        
+                        r_flat = r_window.ravel()
+                        f_flat = f_window.ravel()
+                        d_flat = d_window.ravel()
+                        
+                        # 获取相似像素
+                        idx = similar_indices[i, j]
+                        wgt = similar_weights[i, j]
+                        
+                        # 找到有效权重
+                        valid_sum = 0.0
+                        weighted_residual = 0.0
+                        
+                        for k in range(len(wgt)):
+                            if wgt[k] > 0 and idx[k] < len(r_flat):
+                                d_w = d_flat[idx[k]]
+                                # 防止除零
+                                if d_w > 0:
+                                    combined_w = wgt[k] * d_w
+                                    weighted_residual += r_flat[idx[k]] * combined_w
+                                    valid_sum += combined_w
+                        
+                        if valid_sum > 0:
+                            pred_residuals[i, j] = weighted_residual / valid_sum
+                        
+                return pred_residuals
+            
+            Fit_FC_pred = F_t2_SF_pred.copy()
+            pred_residuals = compute_compensation_numba(
+                F_t1_pad, residuals_pad, dif_pad,
+                F_t1_similar_indices, F_t1_similar_weights,
+                h, w, win_size, pad_size
+            )
+            Fit_FC_pred += pred_residuals
+            
+        else:
+            # 原始循环方式，但做了一些优化
+            Fit_FC_pred = F_t2_SF_pred.copy()
+            pred_residuals = np.zeros_like(residuals)
+            
+            # 预计算窗口视图
+            from numpy.lib.stride_tricks import sliding_window_view
+            r_windows = sliding_window_view(residuals_pad, (win_size, win_size))
+            f_windows = sliding_window_view(F_t1_pad, (win_size, win_size))
+            d_windows = sliding_window_view(dif_pad, (win_size, win_size))
+            
+            # 重塑为3D数组以便快速访问
+            r_windows_flat = r_windows.reshape(h, w, -1)
+            f_windows_flat = f_windows.reshape(h, w, -1)
+            d_windows_flat = d_windows.reshape(h, w, -1)
+            
+            for i in range(h):
+                for j in range(w):
+                    r_flat = r_windows_flat[i, j]
+                    d_flat = d_windows_flat[i, j]
+                    
+                    idx = F_t1_similar_indices[i, j]
+                    wgt = F_t1_similar_weights[i, j]
+                    
+                    valid = wgt > 0
+                    if not np.any(valid):
+                        continue
+                    
+                    idx_valid = idx[valid]
+                    wgt_valid = wgt[valid]
+                    
+                    valid_idx = idx_valid < len(r_flat)
+                    if not np.any(valid_idx):
+                        continue
+                    
+                    idx_final = idx_valid[valid_idx]
+                    wgt_final = wgt_valid[valid_idx]
+                    
+                    d_vals = d_flat[idx_final]
+                    r_vals = r_flat[idx_final]
+                    
+                    # 向量化计算
+                    d_weights = d_vals / (np.max(d_vals) + 1e-8)
+                    combined_weights = wgt_final * d_weights
+                    residual = np.dot(r_vals, combined_weights) / (np.sum(combined_weights) + 1e-8)
+                    
+                    pred_residuals[i, j] = residual
+                    Fit_FC_pred[i, j] += residual
+        
         return Fit_FC_pred, pred_residuals
+
+    
 
     def mrtf(self):
         RM_pred = np.empty(shape=self.F_t1.shape, dtype=np.float32)
@@ -1239,13 +1162,13 @@ class proposed:
 
         similar_indices, similar_weights, F1_classified = self.select_similar_pixels_efficient()
         print("Selected similar pixels!")
-        use_combined = True
+        use_combined = False
         for band_idx in range(self.F_t1.shape[2]):
             if use_combined == True:
                 # 使用多尺度Huber回归
-                coeffs, r = self.regression_model_fitting_combined(band_idx,non_linear_ratio=0.3, min_val = 0.0, max_val=1.0)
+                coeffs, r = self.regression_model_fitting_combined(band_idx,non_linear_ratio=0.3, min_val = -1.0, max_val=1.0)
             else:
-                coeffs, r = self.regression_model_fitting_combined_v2(band_idx,non_linear_ratio=0.3, min_val = 0, max_val=1.0)
+                coeffs, r = self.regression_model_fitting_linear(band_idx, min_val = -1.0, max_val=1.0)
     
             # 为了保持变量名一致，将一次项系数赋值给a，常数项赋值给b
             a = coeffs[:, :, 1]  # 一次项系数（斜率）
@@ -1275,14 +1198,14 @@ class proposed:
 ###########################################################
 #                  Parameters setting                     #
 ###########################################################
-scale_factor = 4
+scale_factor = 20
 similar_win_size = 20
-similar_num = 5
+similar_num = 15
 
-F_tb_path = r"C:\train\20211220_20221224\G_20211220_norl.tif"
-C_tb_path = r"C:\train\20211220_20221224\L_20211220_norl.tif"
-C_tp_path = r"C:\train\20211220_20221224\L_20221224_norl.tif"
-mrtf_path = r"C:\train\20211220_20221224\L_20221224_norl_mrtf.tif"
+F_tb_path = r"C:\baidunetdiskdownload\journal_1\Tianjin\resize_JL_20231109_map_NGBDI.tif"
+C_tb_path = r"C:\baidunetdiskdownload\journal_1\Tianjin\resize_S2_20231110_map_NGBDI.tif"
+C_tp_path = r"C:\baidunetdiskdownload\journal_1\Tianjin\resize_S2_20231120_map_NGBDI.tif"
+mrtf_path = r"C:\baidunetdiskdownload\journal_1\Tianjin\resize_S2_20231110_map_NGBDI_taylor.tif"
 
 if __name__ == "__main__":
     F_tb, F_tb_profile = read_raster(F_tb_path)
